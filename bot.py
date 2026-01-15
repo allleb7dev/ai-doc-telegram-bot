@@ -20,10 +20,11 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 
 llm = ChatOpenAI(
     base_url="https://api.deepseek.com/v1",
-    api_key=DEEPSEEK_API_KEY,
+    api_key=DEEPSEEK_API_KEY,  # ← твой ключ
     model="deepseek-chat",
     temperature=0,
-    max_tokens=1000
+    max_tokens=1000,
+    openai_api_key=DEEPSEEK_API_KEY  # ← явно передаём ключ
 )
 
 
