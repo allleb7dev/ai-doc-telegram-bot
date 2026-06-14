@@ -1,52 +1,58 @@
+import base64
+import json
+import logging
 import os
 import tempfile
-import json
-import base64
-from io import BytesIO
-
-import telegram
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from langchain_openai import ChatOpenAI
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_openai import ChatOpenAI
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-# === НАСТРОЙКИ ===
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 
+
 llm = ChatOpenAI(
     base_url="https://api.deepseek.com/v1",
-    api_key=DEEPSEEK_API_KEY,  # ← твой ключ
+    api_key=DEEPSEEK_API_KEY,
+    openai_api_key=DEEPSEEK_API_KEY,
     model="deepseek-chat",
     temperature=0,
     max_tokens=1000,
-    openai_api_key=DEEPSEEK_API_KEY  # ← явно передаём ключ
 )
 
 
-def get_google_creds():
-    b64_str = os.getenv("GOOGLE_CREDENTIALS_B64")
-    if not b64_str:
-        raise EnvironmentError("GOOGLE_CREDENTIALS_B64 не задан!")
+def require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise EnvironmentError(f"Environment variable {name} is required")
+    return value
 
-    # Отладка: проверим длину
-    print(f"Длина base64: {len(b64_str)}")
+
+def get_google_creds():
+    b64_str = require_env("GOOGLE_CREDENTIALS_B64")
 
     try:
         creds_json = base64.b64decode(b64_str).decode("utf-8")
         creds_dict = json.loads(creds_json)
-        print(f"Email сервисного аккаунта: {creds_dict.get('client_email')}")
-    except Exception as e:
-        print(f"Ошибка декодирования base64: {e}")
-        raise ValueError("Неверный формат GOOGLE_CREDENTIALS_B64") from e
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError("Invalid GOOGLE_CREDENTIALS_B64 value") from exc
 
     return service_account.Credentials.from_service_account_info(
         creds_dict,
-        scopes=['https://www.googleapis.com/auth/spreadsheets']
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
 
 
@@ -55,9 +61,9 @@ def analyze_document(text: str) -> dict:
 - Тип документа
 - Имя человека (если есть)
 - Ключевые факты: должность, город, дата, организация
-- Краткое резюме (1–2 предложения)
+- Краткое резюме в 1-2 предложениях
 
-Верни ТОЛЬКО валидный JSON без ```json.
+Верни только валидный JSON без markdown-обертки.
 
 Формат:
 {{
@@ -72,10 +78,9 @@ def analyze_document(text: str) -> dict:
   "резюме": "..."
 }}
 
-Текст:
+Текст документа:
 {text}
-
-Ответ:"""
+"""
     response = llm.invoke(prompt).content.strip()
     if response.startswith("```json"):
         response = response[7:]
@@ -84,89 +89,95 @@ def analyze_document(text: str) -> dict:
     return json.loads(response.strip())
 
 
-def write_to_sheet(data: dict, sheet_id: str):  # ← параметр теперь `data`
-    try:
-        creds = get_google_creds()
-        service = build('sheets', 'v4', credentials=creds)
-        facts = data.get("факты", {})
-        row = [
-            data.get("файл", ""),
-            data.get("тип", ""),
-            data.get("имя", ""),
-            facts.get("должность", ""),
-            facts.get("город", ""),
-            facts.get("дата", ""),
-            facts.get("организация", ""),
-            data.get("резюме", "")
-        ]
-        service.spreadsheets().values().append(
-            spreadsheetId=sheet_id,
-            range="A:A",
-            valueInputOption="RAW",
-            body={"values": [row]}
-        ).execute()
-    except Exception as e:
-        print(f"Ошибка записи в таблицу: {e}")
+def write_to_sheet(data: dict, sheet_id: str) -> None:
+    creds = get_google_creds()
+    service = build("sheets", "v4", credentials=creds)
+    facts = data.get("факты", {})
+    row = [
+        data.get("файл", ""),
+        data.get("тип", ""),
+        data.get("имя", ""),
+        facts.get("должность", ""),
+        facts.get("город", ""),
+        facts.get("дата", ""),
+        facts.get("организация", ""),
+        data.get("резюме", ""),
+    ]
+    service.spreadsheets().values().append(
+        spreadsheetId=sheet_id,
+        range="A:A",
+        valueInputOption="RAW",
+        body={"values": [row]},
+    ).execute()
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! 🧠 Отправь мне PDF-файл, и я его проанализирую.\n"
-        "Результат сохраню в Google Таблицу."
+def format_response(result: dict) -> str:
+    facts = result.get("факты", {})
+    return (
+        f"Тип: {result.get('тип', '-')}\n"
+        f"Имя: {result.get('имя', '-')}\n"
+        f"Должность: {facts.get('должность', '-')}\n"
+        f"Город: {facts.get('город', '-')}\n"
+        f"Дата: {facts.get('дата', '-')}\n"
+        f"Организация: {facts.get('организация', '-')}\n\n"
+        f"Резюме: {result.get('резюме', '-')}"
     )
 
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    file = update.message.document
-    if file.mime_type != "application/pdf":
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    if update.message:
+        await update.message.reply_text(
+            "Привет. Отправь PDF-файл, и я проанализирую его содержимое.\n"
+            "Результат будет сохранен в Google Sheets."
+        )
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.document:
+        return
+
+    document = update.message.document
+    if document.mime_type != "application/pdf":
         await update.message.reply_text("Пожалуйста, отправь PDF-файл.")
         return
 
-    await update.message.reply_text("📥 Получаю файл...")
+    await update.message.reply_text("Получаю файл...")
+    tmp_path = None
 
     try:
-        # Скачиваем файл
-        tg_file = await context.bot.get_file(file.file_id)
+        tg_file = await context.bot.get_file(document.file_id)
         file_bytes = await tg_file.download_as_bytearray()
 
-        # Читаем PDF
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(file_bytes)
             tmp_path = tmp.name
 
         loader = PyPDFLoader(tmp_path)
         pages = loader.load()
-        full_text = "\n".join([p.page_content for p in pages])
+        full_text = "\n".join(page.page_content for page in pages)
 
-        # Анализируем
-        await update.message.reply_text("🧠 Анализирую документ...")
+        await update.message.reply_text("Анализирую документ...")
         result = analyze_document(full_text)
 
-        # Форматируем ответ
-        response = (
-            f"✅ **Тип**: {result.get('тип', '-')}\n"
-            f"👤 **Имя**: {result.get('имя', '-')}\n"
-            f"💼 **Должность**: {result.get('факты', {}).get('должность', '-')}\n"
-            f"🏙️ **Город**: {result.get('факты', {}).get('город', '-')}\n"
-            f"📅 **Дата**: {result.get('факты', {}).get('дата', '-')}\n"
-            f"🏢 **Организация**: {result.get('факты', {}).get('организация', '-')}\n\n"
-            f"📝 **Резюме**: {result.get('резюме', '-')}"
-        )
-        await update.message.reply_text(response, parse_mode="Markdown")
+        await update.message.reply_text(format_response(result))
 
-        # Сохраняем в таблицу
-        result["файл"] = file.file_name
-        write_to_sheet(result, SPREADSHEET_ID)
-        await update.message.reply_text("📤 Результат сохранён в Google Таблицу!")
-
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+        result["файл"] = document.file_name or "document.pdf"
+        write_to_sheet(result, require_env("SPREADSHEET_ID"))
+        await update.message.reply_text("Результат сохранен в Google Sheets.")
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Document processing failed")
+        await update.message.reply_text(f"Ошибка: {exc}")
     finally:
-        if 'tmp_path' in locals():
+        if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
 
-def main():
+def main() -> None:
+    require_env("TELEGRAM_BOT_TOKEN")
+    require_env("DEEPSEEK_API_KEY")
+    require_env("SPREADSHEET_ID")
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
